@@ -77,19 +77,19 @@ def _saved_model_preset(loop: AgentLoop, session_key: str = "cli:direct") -> str
 
 
 @pytest.mark.asyncio
-async def test_model_command_lists_current_and_available_presets(tmp_path) -> None:
+async def test_model_command_shows_provider_picker(tmp_path) -> None:
     loop = _make_loop(tmp_path)
 
     out = await cmd_model(_ctx(loop, "/model"))
 
     assert "Current model: `base-model`" in out.content
     assert "Current preset: `default`" in out.content
-    assert "Available presets: `default`, `fast`" in out.content
-    assert "`fast`" in out.content
-    assert out.metadata == {"render_as": "text"}
+    assert "Choose a provider:" in out.content
+    assert [row[0] for row in out.buttons] == ["✓ Default", "fast (1)"]
+    assert out.metadata["render_as"] == "text"
+    assert "telegram_callback_data" in out.metadata
 
 
-@pytest.mark.asyncio
 async def test_model_command_switches_preset(tmp_path) -> None:
     loop = _make_loop(tmp_path)
     assert loop.tools_config.my.allow_set is False
