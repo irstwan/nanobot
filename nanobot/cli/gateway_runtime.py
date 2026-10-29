@@ -1038,6 +1038,24 @@ def _run_claimed_gateway(
                 # external listener has started. Keep that work parked too.
                 startup_gate.enter_context(bus.admission.pause_before_start())
             await cron.start()
+            async def _run_preset_sync() -> None:
+                from nanobot.agent.preset_sync import PresetSyncRunner
+
+                settings = config.gateway.preset_sync
+                runner = PresetSyncRunner(
+                    config_path=Path(config_path),
+                    provider=settings.provider,
+                    interval_seconds=max(60.0, settings.interval_minutes * 60.0),
+                    require_stable_cycles=settings.require_stable_cycles,
+                    invalidate=agent.invalidate_runtime_config,
+                )
+                logger.info(
+                    "preset sync enabled for provider '{}', every {} minute(s)",
+                    settings.provider,
+                    settings.interval_minutes,
+                )
+                await runner.run_forever()
+
             async def _run_agent() -> None:
                 try:
                     await bus.admission.wait_until_open()
@@ -1082,6 +1100,10 @@ def _run_claimed_gateway(
                     name="nanobot-gateway-client-monitor",
                 ),
             ])
+            if config.gateway.preset_sync.enabled:
+                tasks.append(asyncio.create_task(
+                    _run_preset_sync(), name="nanobot-preset-sync"
+                ))
             if update_startup is not None:
                 async def activate(startup: "GatewayStartup") -> None:
                     await startup.wait_for_activation(health_identity)

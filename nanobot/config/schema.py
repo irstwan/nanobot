@@ -402,6 +402,15 @@ class ApiConfig(Base):
         )
 
 
+class PresetSyncSettings(Base):
+    """Follow a provider catalog for model presets, without restarts."""
+
+    enabled: bool = False
+    provider: str = "ninerouter"
+    interval_minutes: int = Field(default=30, ge=1)
+    require_stable_cycles: int = Field(default=2, ge=1)
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
@@ -409,6 +418,7 @@ class GatewayConfig(Base):
     port: int = 18790
     restart_mode: Literal["auto", "exec", "spawn", "exit"] = "auto"
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    preset_sync: PresetSyncSettings = Field(default_factory=PresetSyncSettings)
 
 
 class MCPServerConfig(Base):
