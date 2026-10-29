@@ -139,6 +139,10 @@ _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
 _SESSION_PICKER_TTL_S = 900
 _SESSION_PICKER_LIST_LIMIT = 20
 
+# /model picker listings live this long; taps after expiry must re-list.
+_MODEL_PICKER_TTL_S = 900
+_MODEL_PICKER_LIST_LIMIT = 20
+
 
 def _prompt_scope_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Detach only the metadata consumed by workspace scope resolution."""
@@ -475,6 +479,7 @@ class AgentLoop:
         self._chat_session_bindings: dict[tuple[str, str], str] = {}
         self._chat_session_bindings_loaded = False
         self._session_picker_lists: dict[str, dict[str, Any]] = {}
+        self._model_picker_lists: dict[str, dict[str, Any]] = {}
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -1101,6 +1106,57 @@ class AgentLoop:
         ]
         for list_id in stale:
             self._session_picker_lists.pop(list_id, None)
+
+    def register_model_picker_list(
+        self,
+        channel: str,
+        chat_id: str,
+        names: list[str],
+        title: str,
+        parent_id: str | None,
+    ) -> str:
+        """Remember a /model listing so button taps resolve to preset names."""
+        self._prune_model_picker_lists()
+        list_id = secrets.token_hex(3)
+        self._model_picker_lists[list_id] = {
+            "names": list(names),
+            "title": title,
+            "parent_id": parent_id,
+            "channel": channel,
+            "chat_id": chat_id,
+            "created": time.monotonic(),
+        }
+        if len(self._model_picker_lists) > _MODEL_PICKER_LIST_LIMIT:
+            oldest = min(
+                self._model_picker_lists,
+                key=lambda item: self._model_picker_lists[item]["created"],
+            )
+            self._model_picker_lists.pop(oldest, None)
+        return list_id
+
+    def resolve_model_picker_list(
+        self, channel: str, chat_id: str, list_id: str
+    ) -> dict[str, Any] | None:
+        """Return a live /model picker listing, else None."""
+        self._prune_model_picker_lists()
+        entry = self._model_picker_lists.get(list_id)
+        if entry is None or entry["channel"] != channel or entry["chat_id"] != chat_id:
+            return None
+        return {
+            "names": list(entry["names"]),
+            "title": entry["title"],
+            "parent_id": entry["parent_id"],
+        }
+
+    def _prune_model_picker_lists(self) -> None:
+        cutoff = time.monotonic() - _MODEL_PICKER_TTL_S
+        stale = [
+            list_id
+            for list_id, entry in self._model_picker_lists.items()
+            if entry["created"] < cutoff
+        ]
+        for list_id in stale:
+            self._model_picker_lists.pop(list_id, None)
 
     def _can_inject_message(self, msg: InboundMessage) -> bool:
         """Keep independent turns and controls out of user-input batches."""

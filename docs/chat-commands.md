@@ -13,7 +13,7 @@ These commands work inside chat channels and interactive agent sessions:
 | `/stop` | Stop the current task |
 | `/restart` | Restart the bot |
 | `/status` | Show bot status |
-| `/model` | Show the current model and available model presets |
+| `/model` | Show the current model and pick a preset by provider |
 | `/model <preset>` | Switch and persist the model preset for the current session |
 | `/dream` | Run Dream memory consolidation now |
 | `/dream-log` | Show the latest Dream memory change |
@@ -75,7 +75,7 @@ Use `/model` to inspect the current runtime model:
 /model
 ```
 
-The response shows which model this conversation is using and the names of models you can switch to. `default` is also available and uses the instance's default model settings.
+The response shows which model this conversation is using, with tappable provider buttons: pick a provider to see its presets (25 per page), then tap a preset to switch. `default` is also available and uses the instance's default model settings.
 
 To switch presets for future turns:
 

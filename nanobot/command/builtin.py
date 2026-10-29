@@ -400,6 +400,248 @@ def _model_preset_names(loop: AgentLoop) -> list[str]:
     return [*combos, "default", *rest]
 
 
+_MODEL_PICKER_PAGE_SIZE = 25
+
+
+def _model_provider_key(name: str) -> str:
+    """Group key for the /model provider step: combos, default, or id prefix."""
+    if _is_combo_preset(name):
+        return "combos"
+    if name == "default":
+        return "default"
+    return name.split("/", 1)[0] if "/" in name else name
+
+
+def _model_provider_groups(names: list[str]) -> list[tuple[str, str, list[str]]]:
+    """Provider groups in picker order: combos first, then alphabetical.
+
+    "default" is not a group; it is a direct pick on the provider step.
+    """
+    grouped: dict[str, list[str]] = {}
+    for name in names:
+        key = _model_provider_key(name)
+        if key == "default":
+            continue
+        grouped.setdefault(key, []).append(name)
+    groups = [
+        (key, "Combos" if key == "combos" else key, grouped[key])
+        for key in sorted(grouped)
+    ]
+    return [g for g in groups if g[0] == "combos"] + [
+        g for g in groups if g[0] != "combos"
+    ]
+
+
+def _model_picker_reply(
+    ctx: CommandContext,
+    content: str,
+    buttons: list[list[str]] | None = None,
+    callback_data: list[list[str]] | None = None,
+) -> OutboundMessage:
+    metadata: dict[str, Any] = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    if callback_data:
+        # Telegram-only: per-button tap payloads, parallel to `buttons`.
+        metadata["telegram_callback_data"] = callback_data
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        buttons=buttons or [],
+        metadata=metadata,
+    )
+
+
+def _model_switched_reply(ctx: CommandContext, runtime) -> OutboundMessage:
+    max_tokens = runtime.generation.max_tokens
+    lines = [
+        f"Switched model preset to `{runtime.model_preset}`.",
+        "- Scope: current session",
+        f"- Model: `{runtime.model}`",
+        f"- Context window: {runtime.context_window_tokens}",
+    ]
+    lines.append(f"- Max output tokens: {max_tokens}")
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content="\n".join(lines),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def _model_picker_runtime(loop: AgentLoop, ctx: CommandContext):
+    """Best-effort runtime for picker headers; None when it cannot be read."""
+    try:
+        session = ctx.session or await loop.sessions.state.get(ctx.key)
+        return await loop.runtime_for_session(session, recover_removed=False)
+    except Exception:
+        # Markers are cosmetic; a picker without them is still usable.
+        return None
+
+
+def _model_provider_reply(
+    ctx: CommandContext,
+    loop: AgentLoop,
+    names: list[str],
+    runtime,
+    list_id: str | None = None,
+) -> OutboundMessage:
+    if list_id is None:
+        list_id = loop.register_model_picker_list(
+            ctx.msg.channel, ctx.msg.chat_id, names, "providers", None
+        )
+    active = runtime.model_preset or "default" if runtime is not None else None
+    buttons: list[list[str]] = []
+    callback_data: list[list[str]] = []
+    default_index = names.index("default") + 1 if "default" in names else None
+
+    def _default_row() -> tuple[str, str]:
+        label = "✓ Default" if active == "default" else "Default"
+        return label, f"/model pick {list_id}:{default_index}"
+
+    inserted_default = False
+    for key, label, members in _model_provider_groups(names):
+        marked = active is not None and active in members
+        buttons.append([f"{'✓ ' if marked else ''}{label} ({len(members)})"])
+        callback_data.append([f"/model group {list_id}:{key}"])
+        if key == "combos" and default_index is not None:
+            row_label, payload = _default_row()
+            buttons.append([row_label])
+            callback_data.append([payload])
+            inserted_default = True
+    if default_index is not None and not inserted_default:
+        row_label, payload = _default_row()
+        buttons.insert(0, [row_label])
+        callback_data.insert(0, [payload])
+
+    lines = ["## Model"]
+    if runtime is not None:
+        lines.append(f"- Current model: `{runtime.model}`")
+    if active is not None:
+        lines.append(f"- Current preset: `{active}`")
+    lines.append("- Choose a provider:")
+    lines.append("Or switch directly with `/model <preset>`.")
+    return _model_picker_reply(ctx, "\n".join(lines), buttons, callback_data)
+
+
+def _model_group_reply(
+    ctx: CommandContext,
+    entry: dict[str, Any],
+    list_id: str,
+    page: int,
+    runtime,
+) -> OutboundMessage:
+    names: list[str] = entry["names"]
+    title: str = entry["title"]
+    parent_id = entry["parent_id"]
+    page_size = _MODEL_PICKER_PAGE_SIZE
+    n_pages = max(1, (len(names) + page_size - 1) // page_size)
+    page = min(max(page, 0), n_pages - 1)
+    active = runtime.model_preset or "default" if runtime is not None else None
+    buttons: list[list[str]] = []
+    callback_data: list[list[str]] = []
+    for position, name in enumerate(
+        names[page * page_size : (page + 1) * page_size],
+        start=page * page_size + 1,
+    ):
+        buttons.append([f"{'✓ ' if name == active else ''}{name}"])
+        callback_data.append([f"/model pick {list_id}:{position}"])
+    if n_pages > 1:
+        nav: list[str] = []
+        nav_data: list[str] = []
+        if page > 0:
+            nav.append("« Previous")
+            nav_data.append(f"/model page {list_id}:{page - 1}")
+        nav.append(f"{page + 1}/{n_pages}")
+        nav_data.append(f"/model page {list_id}:{page}")
+        if page < n_pages - 1:
+            nav.append("Next »")
+            nav_data.append(f"/model page {list_id}:{page + 1}")
+        buttons.append(nav)
+        callback_data.append(nav_data)
+    if parent_id is not None:
+        buttons.append(["« Providers"])
+        callback_data.append([f"/model providers {parent_id}"])
+
+    lines = [f"## Model — {title}"]
+    if runtime is not None:
+        lines.append(f"- Current model: `{runtime.model}`")
+    if active is not None:
+        lines.append(f"- Current preset: `{active}`")
+    lines.append(f"- Page {page + 1}/{n_pages} — {len(names)} presets")
+    return _model_picker_reply(ctx, "\n".join(lines), buttons, callback_data)
+
+
+async def _model_picker_command(
+    ctx: CommandContext, verb: str, payload: str
+) -> OutboundMessage:
+    """Handle /model button taps: pick, group, page, and providers."""
+    loop = ctx.loop
+    list_id, _, tail = payload.partition(":")
+    entry = (
+        loop.resolve_model_picker_list(ctx.msg.channel, ctx.msg.chat_id, list_id)
+        if list_id
+        else None
+    )
+    if entry is None:
+        return _model_picker_reply(
+            ctx, "This model list has expired. Send /model to see it again."
+        )
+    unavailable = _model_picker_reply(
+        ctx, "That choice is no longer available. Send /model to see the list again."
+    )
+    runtime = await _model_picker_runtime(loop, ctx)
+    if verb == "providers":
+        return _model_provider_reply(
+            ctx, loop, entry["names"], runtime, list_id=list_id
+        )
+    if verb == "group":
+        members = [
+            name for name in entry["names"] if _model_provider_key(name) == tail
+        ]
+        if not members:
+            return unavailable
+        label = "Combos" if tail == "combos" else tail
+        group_id = loop.register_model_picker_list(
+            ctx.msg.channel, ctx.msg.chat_id, members, label, list_id
+        )
+        return _model_group_reply(
+            ctx,
+            {"names": members, "title": label, "parent_id": list_id},
+            group_id,
+            0,
+            runtime,
+        )
+    if verb == "page":
+        try:
+            page = int(tail)
+        except ValueError:
+            return unavailable
+        return _model_group_reply(ctx, entry, list_id, page, runtime)
+    if verb == "pick":
+        try:
+            index = int(tail)
+        except ValueError:
+            return unavailable
+        if not 1 <= index <= len(entry["names"]):
+            return unavailable
+        name = entry["names"][index - 1]
+        try:
+            switched = await loop.set_session_model_preset(ctx.key, name)
+        except (KeyError, ValueError) as exc:
+            names = _model_preset_names(loop)
+            return OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=(
+                    f"Could not switch model preset: {_command_error_message(exc)}\n\n"
+                    f"Available presets: {_format_preset_names(names)}"
+                ),
+                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+            )
+        return _model_switched_reply(ctx, switched)
+    return unavailable
+
+
 def _command_error_message(exc: Exception) -> str:
     return str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
 
@@ -432,12 +674,20 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
 
     if not args:
         session = ctx.session or await loop.sessions.state.get(ctx.key)
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=await _model_command_status(loop, session),
-            metadata=metadata,
-        )
+        try:
+            runtime = await loop.runtime_for_session(session, recover_removed=False)
+        except (KeyError, ValueError):
+            return OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=await _model_command_status(loop, session),
+                metadata=metadata,
+            )
+        return _model_provider_reply(ctx, loop, _model_preset_names(loop), runtime)
+
+    first, _, rest = args.partition(" ")
+    if first in ("pick", "group", "page", "providers") and rest.strip():
+        return await _model_picker_command(ctx, first, rest.strip())
 
     name = args
     try:
@@ -454,20 +704,7 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
             metadata=metadata,
         )
 
-    max_tokens = runtime.generation.max_tokens
-    lines = [
-        f"Switched model preset to `{runtime.model_preset}`.",
-        "- Scope: current session",
-        f"- Model: `{runtime.model}`",
-        f"- Context window: {runtime.context_window_tokens}",
-    ]
-    lines.append(f"- Max output tokens: {max_tokens}")
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content="\n".join(lines),
-        metadata=metadata,
-    )
+    return _model_switched_reply(ctx, runtime)
 
 
 async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
