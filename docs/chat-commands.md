@@ -5,6 +5,10 @@ These commands work inside chat channels and interactive agent sessions:
 | Command | Description |
 |---------|-------------|
 | `/new` | Stop current task and start a new conversation |
+| `/sessions` | List saved sessions and switch this chat to one |
+| `/sessions <n>` | Switch to list entry n from the latest `/sessions` list |
+| `/sessions clear` | Return to this chat's default session |
+| `/sessions delete <n>` | Delete list entry n from the latest `/sessions` list (asks for confirmation) |
 | `/compact` | Summarize the current conversation context while keeping saved chat history |
 | `/stop` | Stop the current task |
 | `/restart` | Restart the bot |
@@ -27,6 +31,19 @@ These commands work inside chat channels and interactive agent sessions:
 | `/pairing revoke <user_id>` | Revoke a previously approved user on the current channel |
 | `/pairing revoke <channel> <user_id>` | Revoke a previously approved user on a specific channel |
 | `/help` | Show available in-chat commands |
+
+## Switching sessions
+
+Each chat normally continues its own default session. `/sessions` lists saved
+sessions (newest first, internal Dream/subagent sessions excluded) with inline
+buttons; tapping one — or replying `/sessions <n>` — switches the chat to that
+session. The switch is stored per chat and survives gateway restarts. Topic
+threads keep their own sessions and take precedence over a switch. `/new`
+resets whichever session the chat is currently switched to; `/sessions clear`
+removes the switch so the chat returns to its default session. To delete a
+session, reply `/sessions delete <n>` with the number from the latest list; a
+confirmation button appears first, the session currently in use cannot be
+deleted, and deleting is permanent (including the session's descendants).
 
 ## Commands and file paths
 

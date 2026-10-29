@@ -599,6 +599,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
         BotCommand("history", "Show recent conversation messages"),
+        BotCommand("sessions", "List saved sessions and switch this chat to one"),
         BotCommand("goal", "Start a sustained objective (long-running task)"),
         BotCommand("trigger", "Create a named local trigger"),
         BotCommand("pairing", "Manage DM pairing (approve/deny/list)"),
@@ -616,7 +617,7 @@ class TelegramChannel(BaseChannel):
     # Telegram-safe aliases are normalized before reaching the core router.
     # Canonical hyphenated commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|compact|stop|restart|status|dream|history|goal|trigger|pairing|model|skill"
+        r"^/(?:new|compact|stop|restart|status|dream|history|goal|trigger|pairing|model|skill|sessions"
         r"|dream_log|dream_restore|dream_prompt|evaluator_prompt|evaluator-prompt)(?:@\w+)?(?:\s+[\s\S]*)?$"
     )
 
@@ -1243,7 +1244,13 @@ class TelegramChannel(BaseChannel):
         if msg.content and msg.content != "[empty message]":
             render_as_blockquote = bool(progress_event and progress_event.tool_hint)
             buttons = cast(list[list[str]], getattr(msg, "buttons", None) or [])
-            reply_markup = self._build_keyboard(buttons) if buttons else None
+            callback_data = cast(
+                list[list[str]] | None,
+                (msg.metadata or {}).get("telegram_callback_data"),
+            )
+            reply_markup = (
+                self._build_keyboard(buttons, callback_data) if buttons else None
+            )
             text = msg.content
             if msg.metadata.get("render_as") == "text":
                 text = _telegram_command_text(text)
@@ -2251,13 +2258,36 @@ class TelegramChannel(BaseChannel):
 
         return ""
 
-    def _build_keyboard(self, buttons: list[list[str]]) -> InlineKeyboardMarkup | None:
-        """Build inline keyboard markup if inline_keyboards is enabled."""
+    def _build_keyboard(
+        self,
+        buttons: list[list[str]],
+        callback_data: list[list[str]] | None = None,
+    ) -> InlineKeyboardMarkup | None:
+        """Build inline keyboard markup if inline_keyboards is enabled.
+
+        ``callback_data`` carries per-button tap payloads (e.g. /sessions pick
+        commands) parallel to ``buttons``; labels stay human-readable while
+        taps arrive as the payload text. Falls back to labels on shape mismatch.
+        """
         if not buttons or not self.config.inline_keyboards:
             return None
+        use_data = callback_data is not None and len(callback_data) == len(buttons)
+        if use_data:
+            for data_row, row in zip(callback_data, buttons):
+                if len(data_row) != len(row):
+                    use_data = False
+                    break
         keyboard = [
-            [InlineKeyboardButton(label, callback_data=self._safe_callback_data(label)) for label in row]
-            for row in buttons
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=self._safe_callback_data(
+                        callback_data[row_index][col_index] if use_data else label
+                    ),
+                )
+                for col_index, label in enumerate(row)
+            ]
+            for row_index, row in enumerate(buttons)
         ]
         return InlineKeyboardMarkup(keyboard)
 

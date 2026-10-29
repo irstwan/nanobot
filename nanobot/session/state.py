@@ -833,6 +833,31 @@ class SessionState:
             write=False,
         )
 
+    async def list_chat_session_bindings(self) -> dict[tuple[str, str], str]:
+        """Read chat -> session bindings used by /sessions switching."""
+        return await self._execute(
+            None,
+            lambda: self._store.list_chat_session_bindings(),
+            operation_name="list_chat_session_bindings",
+            write=False,
+        )
+
+    async def set_chat_session_binding(
+        self, channel: str, chat_id: str, session_key: str
+    ) -> None:
+        await self._execute(
+            None,
+            lambda: self._store.set_chat_session_binding(channel, chat_id, session_key),
+            operation_name="set_chat_session_binding",
+        )
+
+    async def clear_chat_session_binding(self, channel: str, chat_id: str) -> None:
+        await self._execute(
+            None,
+            lambda: self._store.clear_chat_session_binding(channel, chat_id),
+            operation_name="clear_chat_session_binding",
+        )
+
     async def list_metadata(self) -> list[dict[str, Any]]:
         return await self.query_metadata(lambda rows: rows)
 

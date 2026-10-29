@@ -650,3 +650,7 @@ class SessionManager:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self._store.list_sessions())
+
+    def list_chat_session_bindings(self) -> dict[tuple[str, str], str]:
+        """Synchronous binding read for session-key routing (see AgentLoop)."""
+        return self._store.list_chat_session_bindings()

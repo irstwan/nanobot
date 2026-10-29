@@ -9,6 +9,7 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from loguru import logger
@@ -74,6 +75,14 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Reset this chat and start a fresh conversation.",
         "square-pen",
         lifecycle="finalize_active_turn",
+    ),
+    BuiltinCommandSpec(
+        "/sessions",
+        "Switch session",
+        "List, switch, or delete saved sessions.",
+        "history",
+        "[n | delete <n> | clear]",
+        accepts_args=True,
     ),
     BuiltinCommandSpec(
         "/compact",
@@ -373,10 +382,22 @@ def _format_preset_names(names: list[str]) -> str:
     return ", ".join(f"`{name}`" for name in names) if names else "(none configured)"
 
 
+def _is_combo_preset(name: str) -> bool:
+    """9router combo presets use the user's *-pilihan naming.
+
+    Nanobot presets carry no upstream owned_by flag, so combo detection
+    relies on this naming convention: a future combo with a different
+    name will sort with the rest until it is renamed *-pilihan.
+    """
+    return name.endswith("-pilihan")
+
+
 def _model_preset_names(loop: AgentLoop) -> list[str]:
     names = set(loop.model_presets)
     names.add("default")
-    return ["default", *sorted(name for name in names if name != "default")]
+    combos = sorted(name for name in names if name != "default" and _is_combo_preset(name))
+    rest = sorted(name for name in names if name != "default" and not _is_combo_preset(name))
+    return [*combos, "default", *rest]
 
 
 def _command_error_message(exc: Exception) -> str:
@@ -840,6 +861,289 @@ _HISTORY_MAX_COUNT = 50
 _HISTORY_MAX_CONTENT_CHARS = 200
 
 
+_SESSIONS_MAX_LIST = 10
+_SESSIONS_INTERNAL_PREFIXES = ("dream:", "subagent:")
+
+
+def _sessions_display_text(info: dict[str, Any]) -> str:
+    """One-line label for a saved session: title, else first-message preview."""
+    title = str(info.get("title") or "").strip()
+    text = title or str(info.get("preview") or "").strip().replace("\n", " ")
+    if len(text) > 60:
+        text = text[:60] + "…"
+    return text or "(empty session)"
+
+
+def _sessions_relative_time(updated_at: object) -> str:
+    """Relative time for a session's last update (UTC ISO string)."""
+    if not isinstance(updated_at, str) or not updated_at:
+        return ""
+    try:
+        moment = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    seconds = (datetime.now(timezone.utc) - moment).total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h ago"
+    return f"{int(seconds // 86400)} d ago"
+
+
+def _sessions_reply(
+    ctx: CommandContext,
+    content: str,
+    buttons: list[list[str]] | None = None,
+    callback_data: list[list[str]] | None = None,
+) -> OutboundMessage:
+    metadata: dict[str, Any] = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    if callback_data:
+        # Telegram-only: per-button tap payloads, parallel to `buttons`.
+        metadata["telegram_callback_data"] = callback_data
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        buttons=buttons or [],
+        metadata=metadata,
+    )
+
+
+async def cmd_sessions(ctx: CommandContext) -> OutboundMessage:
+    """List saved sessions and switch this chat to one.
+
+    Usage: /sessions — list; /sessions <n> — switch to list entry n;
+    /sessions pick <list>:<n> — switch from an inline-button tap;
+    /sessions delete <n> — delete list entry n (asks for confirmation first);
+    /sessions clear — return to this chat's default session.
+    """
+    loop = ctx.loop
+    args = ctx.args.strip()
+    current_key = ctx.key
+
+    if args.lower() == "clear":
+        await loop.clear_chat_session_binding(ctx.msg.channel, ctx.msg.chat_id)
+        return _sessions_reply(
+            ctx,
+            "Back to this chat's default session. The next message starts or "
+            "continues the default session.",
+        )
+
+    lowered = args.lower()
+    if lowered == "delete-no":
+        return _sessions_reply(ctx, "Deletion cancelled. Nothing changed.")
+    if lowered.startswith("delete-yes "):
+        _, _, confirm_arg = args.partition(" ")
+        list_id, sep, index_text = confirm_arg.strip().partition(":")
+        keys = (
+            loop.resolve_session_picker_list(
+                ctx.msg.channel, ctx.msg.chat_id, list_id
+            )
+            if sep and index_text.strip().isdigit()
+            else None
+        )
+        if keys is None:
+            return _sessions_reply(
+                ctx,
+                "That confirmation has expired. Send /sessions again for "
+                "a fresh list.",
+            )
+        index = int(index_text.strip()) - 1
+        if not 0 <= index < len(keys):
+            return _sessions_reply(
+                ctx,
+                f"Number out of range (1–{len(keys)}). Send /sessions "
+                "to see the list again.",
+            )
+        target = keys[index]
+        infos = await loop.sessions.state.list_sessions()
+        info = next((row for row in infos if row.get("key") == target), None)
+        if info is None:
+            return _sessions_reply(
+                ctx, "That session no longer exists. Send /sessions for a fresh list."
+            )
+        effective_key = loop._effective_session_key(ctx.msg)  # pyright: ignore[reportPrivateUsage]
+        if target == effective_key:
+            return _sessions_reply(
+                ctx,
+                "This session is in use by this chat. Switch to another "
+                "session before deleting it.",
+            )
+        deleted = await loop.sessions.state.delete(target)
+        if not deleted:
+            return _sessions_reply(
+                ctx, "That session no longer exists. Send /sessions for a fresh list."
+            )
+        bindings = await loop.sessions.state.list_chat_session_bindings()
+        if bindings.get((ctx.msg.channel, ctx.msg.chat_id)) == target:
+            await loop.clear_chat_session_binding(ctx.msg.channel, ctx.msg.chat_id)
+        return _sessions_reply(
+            ctx,
+            f"Session deleted: {_sessions_display_text(info)}\n"
+            "Send /sessions for a fresh list.",
+        )
+    if lowered.startswith("delete ") or lowered == "delete":
+        parts = args.split(None, 1)
+        number_text = parts[1].strip() if len(parts) > 1 else ""
+        if not number_text.isdigit():
+            return _sessions_reply(
+                ctx,
+                "Usage: /sessions delete <n> — delete that numbered session "
+                "from the latest /sessions list (asks first).",
+            )
+        keys = loop.latest_session_picker_list(ctx.msg.channel, ctx.msg.chat_id)
+        if keys is None:
+            return _sessions_reply(
+                ctx,
+                "No session list yet. Send /sessions first, then reply "
+                "with its number.",
+            )
+        index = int(number_text) - 1
+        if not 0 <= index < len(keys):
+            return _sessions_reply(
+                ctx,
+                f"Number out of range (1–{len(keys)}). Send /sessions "
+                "to see the list again.",
+            )
+        target = keys[index]
+        infos = await loop.sessions.state.list_sessions()
+        info = next((row for row in infos if row.get("key") == target), None)
+        if info is None:
+            return _sessions_reply(
+                ctx, "That session no longer exists. Send /sessions for a fresh list."
+            )
+        effective_key = loop._effective_session_key(ctx.msg)  # pyright: ignore[reportPrivateUsage]
+        if target == effective_key:
+            return _sessions_reply(
+                ctx,
+                "This session is in use by this chat. Switch to another "
+                "session before deleting it.",
+            )
+        confirm_list_id = loop.register_session_picker_list(
+            ctx.msg.channel, ctx.msg.chat_id, keys
+        )
+        return _sessions_reply(
+            ctx,
+            f"Delete this session permanently?\n{_sessions_display_text(info)}\n"
+            "Its history cannot be recovered.",
+            buttons=[["Yes, delete"], ["Cancel"]],
+            callback_data=[
+                [f"/sessions delete-yes {confirm_list_id}:{index + 1}"],
+                ["/sessions delete-no"],
+            ],
+        )
+
+    if args:
+        target: str | None = None
+        if args.lower().startswith("pick "):
+            pick_arg = args[5:].strip()
+            list_id, sep, index_text = pick_arg.partition(":")
+            keys = (
+                loop.resolve_session_picker_list(
+                    ctx.msg.channel, ctx.msg.chat_id, list_id
+                )
+                if sep and index_text.strip().isdigit()
+                else None
+            )
+            if keys is not None:
+                index = int(index_text.strip()) - 1
+                if 0 <= index < len(keys):
+                    target = keys[index]
+            if target is None:
+                return _sessions_reply(
+                    ctx,
+                    "That session choice has expired. Send /sessions again for "
+                    "a fresh list.",
+                )
+        elif args.isdigit():
+            keys = loop.latest_session_picker_list(ctx.msg.channel, ctx.msg.chat_id)
+            if keys is None:
+                return _sessions_reply(
+                    ctx,
+                    "No session list yet. Send /sessions first, then reply "
+                    "with its number.",
+                )
+            index = int(args) - 1
+            if not 0 <= index < len(keys):
+                return _sessions_reply(
+                    ctx,
+                    f"Number out of range (1–{len(keys)}). Send /sessions "
+                    "to see the list again.",
+                )
+            target = keys[index]
+        else:
+            return _sessions_reply(
+                ctx,
+                "Usage: /sessions — list; /sessions <n> — switch; "
+                "/sessions delete <n> — delete (asks first); "
+                "/sessions clear — back to the default session.",
+            )
+        if target is None:
+            return _sessions_reply(
+                ctx, "Session not found. Send /sessions for a fresh list."
+            )
+
+        infos = await loop.sessions.state.list_sessions()
+        info = next((row for row in infos if row.get("key") == target), None)
+        if info is None:
+            return _sessions_reply(
+                ctx, "That session no longer exists. Send /sessions for a fresh list."
+            )
+        if target == current_key:
+            return _sessions_reply(ctx, "This chat is already on that session.")
+        await loop._cancel_active_tasks(current_key)  # pyright: ignore[reportPrivateUsage]
+        await loop.set_chat_session_binding(ctx.msg.channel, ctx.msg.chat_id, target)
+        return _sessions_reply(
+            ctx,
+            f"Switched to session: {_sessions_display_text(info)}\n"
+            "The next message continues this session. /sessions to switch again, "
+            "/new to restart this session, /sessions clear to go back "
+            "to the default session.",
+        )
+
+    infos = await loop.sessions.state.list_sessions()
+    candidates = [
+        info
+        for info in infos
+        if not str(info.get("key", "")).startswith(_SESSIONS_INTERNAL_PREFIXES)
+    ]
+    shown = candidates[:_SESSIONS_MAX_LIST]
+    if not shown:
+        return _sessions_reply(ctx, "No saved sessions yet.")
+    list_id = loop.register_session_picker_list(
+        ctx.msg.channel, ctx.msg.chat_id, [str(info["key"]) for info in shown]
+    )
+    lines = ["Saved sessions (newest first):"]
+    buttons: list[list[str]] = []
+    callback_data: list[list[str]] = []
+    for index, info in enumerate(shown, start=1):
+        display = _sessions_display_text(info)
+        relative = _sessions_relative_time(info.get("updated_at"))
+        marker = " — this session" if info["key"] == current_key else ""
+        lines.append(
+            f"{index}. {display}" + (f" ({relative})" if relative else "") + marker
+        )
+        buttons.append([f"{index}. {display[:32]}"])
+        callback_data.append([f"/sessions pick {list_id}:{index}"])
+    lines.append("")
+    lines.append(
+        "Tap a button, or reply /sessions <n>. "
+        "/sessions clear goes back to the default session. "
+        "/sessions delete <n> deletes a session (asks first)."
+    )
+    if len(candidates) > _SESSIONS_MAX_LIST:
+        lines.append(
+            f"Showing the {_SESSIONS_MAX_LIST} newest; older sessions are available via the WebUI."
+        )
+    return _sessions_reply(
+        ctx, "\n".join(lines), buttons=buttons, callback_data=callback_data
+    )
+
+
 def _format_history_message(msg: dict[str, Any]) -> str | None:
     """Format a single history message for display. Returns None to skip."""
     role = msg.get("role")
@@ -1072,6 +1376,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
+    router.exact("/sessions", cmd_sessions)
+    router.prefix("/sessions ", cmd_sessions)
     router.exact("/compact", cmd_compact, session_queue=True)
     router.exact("/status", cmd_status)
     router.exact("/model", cmd_model)

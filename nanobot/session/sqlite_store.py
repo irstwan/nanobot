@@ -96,9 +96,19 @@ def _create_schema_v2(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
+def _create_schema_v3(db: sqlite3.Connection) -> None:
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS chat_session_bindings (
+            channel TEXT NOT NULL, chat_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            PRIMARY KEY (channel, chat_id)
+        )"""
+    )
+
+
 # Entries upgrade version N to N+1. Preserve released entries and append upgrades.
 _SCHEMA_MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
-    _create_schema_v1, _create_schema_v2,
+    _create_schema_v1, _create_schema_v2, _create_schema_v3,
 )
 
 
@@ -533,6 +543,32 @@ class SqliteSessionStore:
             return [SessionInfo(key=row[0], created_at=row[1], updated_at=row[2],
                                 title=row[3], preview=row[4], path=str(self.path))
                     for row in db.execute("SELECT key, created_at, updated_at, title, preview FROM sessions ORDER BY updated_at DESC")]
+
+    def list_chat_session_bindings(self) -> dict[tuple[str, str], str]:
+        """Read chat -> session bindings used by /sessions switching."""
+        with self.transaction(write=False) as db:
+            return {
+                (str(row[0]), str(row[1])): str(row[2])
+                for row in db.execute(
+                    "SELECT channel, chat_id, session_key FROM chat_session_bindings"
+                )
+            }
+
+    def set_chat_session_binding(self, channel: str, chat_id: str, session_key: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO chat_session_bindings (channel, chat_id, session_key)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(channel, chat_id) DO UPDATE SET session_key=excluded.session_key",
+                (channel, chat_id, session_key),
+            )
+
+    def clear_chat_session_binding(self, channel: str, chat_id: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM chat_session_bindings WHERE channel=? AND chat_id=?",
+                (channel, chat_id),
+            )
 
     def child_session_keys(self, parent_key: str) -> list[str]:
         """Find all persisted child kinds without decoding unrelated metadata."""

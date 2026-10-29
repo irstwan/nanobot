@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import secrets
 import time
 import weakref
 from collections.abc import Coroutine, Iterable, Mapping
@@ -133,6 +134,10 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
+
+# /sessions picker listings live this long; taps after expiry must re-list.
+_SESSION_PICKER_TTL_S = 900
+_SESSION_PICKER_LIST_LIMIT = 20
 
 
 def _prompt_scope_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -464,6 +469,12 @@ class AgentLoop:
         if model_preset:
             self.set_model_preset(model_preset, publish_update=False)
         self._register_default_tools(provider_snapshot_loader=provider_snapshot_loader)
+        # Chat -> session bindings from /sessions switches. Loaded lazily
+        # from durable storage; the gateway process is the only writer, so
+        # the cache stays fresh for the life of this loop.
+        self._chat_session_bindings: dict[tuple[str, str], str] = {}
+        self._chat_session_bindings_loaded = False
+        self._session_picker_lists: dict[str, dict[str, Any]] = {}
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -1002,7 +1013,94 @@ class AgentLoop:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
+        if not msg.session_key_override:
+            # Explicit overrides (e.g. Telegram topic threads) always win over
+            # a /sessions binding; bindings only redirect the default key.
+            self._ensure_chat_session_bindings()
+            bound = self._chat_session_bindings.get((msg.channel, msg.chat_id))
+            if bound:
+                return bound
         return msg.session_key
+
+    def _ensure_chat_session_bindings(self) -> None:
+        """Load persisted chat -> session bindings once; fail open to defaults."""
+        if self._chat_session_bindings_loaded:
+            return
+        self._chat_session_bindings_loaded = True
+        try:
+            self._chat_session_bindings = dict(self.sessions.list_chat_session_bindings())
+        except Exception:
+            logger.debug("Chat session bindings unavailable; using default session keys")
+            self._chat_session_bindings = {}
+
+    async def set_chat_session_binding(
+        self, channel: str, chat_id: str, session_key: str
+    ) -> None:
+        """Persist a /sessions switch and refresh the routing cache."""
+        await self.sessions.state.set_chat_session_binding(channel, chat_id, session_key)
+        self._ensure_chat_session_bindings()
+        self._chat_session_bindings[(channel, chat_id)] = session_key
+
+    async def clear_chat_session_binding(self, channel: str, chat_id: str) -> None:
+        """Drop a /sessions switch so the chat returns to its default session."""
+        await self.sessions.state.clear_chat_session_binding(channel, chat_id)
+        self._ensure_chat_session_bindings()
+        self._chat_session_bindings.pop((channel, chat_id), None)
+
+    def register_session_picker_list(
+        self, channel: str, chat_id: str, keys: list[str]
+    ) -> str:
+        """Remember a /sessions listing so button taps resolve to session keys."""
+        self._prune_session_picker_lists()
+        list_id = secrets.token_hex(3)
+        self._session_picker_lists[list_id] = {
+            "keys": list(keys),
+            "channel": channel,
+            "chat_id": chat_id,
+            "created": time.monotonic(),
+        }
+        if len(self._session_picker_lists) > _SESSION_PICKER_LIST_LIMIT:
+            oldest = min(
+                self._session_picker_lists,
+                key=lambda item: self._session_picker_lists[item]["created"],
+            )
+            self._session_picker_lists.pop(oldest, None)
+        return list_id
+
+    def resolve_session_picker_list(
+        self, channel: str, chat_id: str, list_id: str
+    ) -> list[str] | None:
+        """Return the session keys of a live picker listing, else None."""
+        self._prune_session_picker_lists()
+        entry = self._session_picker_lists.get(list_id)
+        if entry is None or entry["channel"] != channel or entry["chat_id"] != chat_id:
+            return None
+        return list(entry["keys"])
+
+    def latest_session_picker_list(self, channel: str, chat_id: str) -> list[str] | None:
+        """Return the newest live picker listing for a chat, else None."""
+        self._prune_session_picker_lists()
+        best: list[str] | None = None
+        best_created = -1.0
+        for entry in self._session_picker_lists.values():
+            if (
+                entry["channel"] == channel
+                and entry["chat_id"] == chat_id
+                and entry["created"] > best_created
+            ):
+                best_created = entry["created"]
+                best = list(entry["keys"])
+        return best
+
+    def _prune_session_picker_lists(self) -> None:
+        cutoff = time.monotonic() - _SESSION_PICKER_TTL_S
+        stale = [
+            list_id
+            for list_id, entry in self._session_picker_lists.items()
+            if entry["created"] < cutoff
+        ]
+        for list_id in stale:
+            self._session_picker_lists.pop(list_id, None)
 
     def _can_inject_message(self, msg: InboundMessage) -> bool:
         """Keep independent turns and controls out of user-input batches."""
