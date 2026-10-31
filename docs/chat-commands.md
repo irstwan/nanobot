@@ -34,16 +34,20 @@ These commands work inside chat channels and interactive agent sessions:
 
 ## Switching sessions
 
-Each chat normally continues its own default session. `/sessions` lists saved
-sessions (newest first, internal Dream/subagent sessions excluded) with inline
-buttons; tapping one — or replying `/sessions <n>` — switches the chat to that
+Each chat owns its own sessions: `/sessions` lists the sessions that belong to
+this chat (newest first, internal Dream/subagent sessions excluded) with inline
+buttons. Tapping one — or replying `/sessions <n>` — switches the chat to that
 session. The switch is stored per chat and survives gateway restarts. Topic
-threads keep their own sessions and take precedence over a switch. `/new`
-resets whichever session the chat is currently switched to; `/sessions clear`
-removes the switch so the chat returns to its default session. To delete a
-session, reply `/sessions delete <n>` with the number from the latest list; a
-confirmation button appears first, the session currently in use cannot be
-deleted, and deleting is permanent (including the session's descendants).
+threads keep their own sessions and take precedence over a switch.
+
+`/new` starts a fresh session for this chat and keeps the previous conversation
+as its own entry, so the old session stays in `/sessions` and can be switched
+back to. In a topic thread, where the chat cannot be redirected, `/new` instead
+clears that thread's session in place. `/sessions clear` removes the switch so
+the chat returns to its default session. To delete a session, reply
+`/sessions delete <n>` with the number from the latest list; a confirmation
+button appears first, the session currently in use cannot be deleted, and
+deleting is permanent (including the session's descendants).
 
 ## Commands and file paths
 

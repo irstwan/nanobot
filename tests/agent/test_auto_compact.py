@@ -667,7 +667,12 @@ class TestAutoCompactIdleDetection:
         assert "new session started" in response.content.lower()
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == 0
+        # /new keeps the previous conversation and moves the chat to a fresh one.
+        assert len(session_after.messages) == 8
+        bindings = await loop.sessions.state.list_chat_session_bindings()
+        assert bindings[("cli", "test")] == "cli:test#2"
+        fresh = await loop.sessions.state.get("cli:test#2")
+        assert fresh.messages == []
         await loop.aclose()
 
     @pytest.mark.asyncio

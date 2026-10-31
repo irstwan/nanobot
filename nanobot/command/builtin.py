@@ -19,6 +19,13 @@ from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, Outbound
 from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
 from nanobot.providers.base import LLMUsage
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
+from nanobot.session.keys import (
+    UNIFIED_SESSION_KEY,
+    next_successor_session_key,
+    session_base_key,
+    session_key_for_channel,
+    session_key_under_base,
+)
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
@@ -72,14 +79,14 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
     BuiltinCommandSpec(
         "/new",
         "New chat",
-        "Reset this chat and start a fresh conversation.",
+        "Start a fresh session, keeping this one in /sessions.",
         "square-pen",
         lifecycle="finalize_active_turn",
     ),
     BuiltinCommandSpec(
         "/sessions",
         "Switch session",
-        "List, switch, or delete saved sessions.",
+        "List this chat's sessions, then switch or delete.",
         "history",
         "[n | delete <n> | clear]",
         accepts_args=True,
@@ -321,8 +328,41 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def _started_session_key(loop: AgentLoop, ctx: CommandContext) -> str | None:
+    """Create an empty session for this chat and point the chat at it.
+
+    Returns the new key, or None when the chat cannot be redirected (unified
+    sessions, topic threads and other explicit session overrides) and the
+    caller must fall back to resetting the current session in place.
+    """
+    channel = ctx.msg.channel
+    chat_id = ctx.msg.chat_id
+    if getattr(ctx.msg, "session_key_override", None) or ctx.key == UNIFIED_SESSION_KEY:
+        return None
+    base = session_base_key(ctx.key)
+    infos = await loop.sessions.state.list_sessions()
+    keys = [str(info.get("key", "")) for info in infos]
+    if ctx.key not in keys:
+        keys.append(ctx.key)
+    # Reuse the newest empty successor so repeated /new without chatting does
+    # not pile up blank rows in the picker.
+    for key in sorted((k for k in keys if k.startswith(f"{base}#")), reverse=True):
+        existing = await loop.sessions.state.get(key)
+        if not existing.messages:
+            await loop.set_chat_session_binding(channel, chat_id, key)
+            return key
+    new_key = next_successor_session_key(base, set(keys))
+    await loop.sessions.state.get(new_key)
+    await loop.set_chat_session_binding(channel, chat_id, new_key)
+    return new_key
+
+
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Stop active task and start a fresh session."""
+    """Stop active task and start a fresh session.
+
+    The current conversation is kept as its own session so it stays listed in
+    /sessions and can be switched back to; this chat moves to a new empty one.
+    """
     loop = ctx.loop
     await loop._cancel_active_tasks(ctx.key)  # pyright: ignore[reportPrivateUsage]
     loop.discard_session_file_state(ctx.key)
@@ -338,8 +378,10 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
             metadata=dict(session.metadata),
             provider_state=None,
         )
+
     async def reset_and_schedule_archive() -> None:
-        await loop.sessions.state.reset(session.key)
+        if await _started_session_key(loop, ctx) is None:
+            await loop.sessions.state.reset(session.key)
         if archive_snapshot is not None and runtime is not None:
             loop.schedule_background(
                 loop.consolidator.archive_session(  # pyright: ignore[reportUnknownMemberType]
@@ -1343,10 +1385,15 @@ async def cmd_sessions(ctx: CommandContext) -> OutboundMessage:
         )
 
     infos = await loop.sessions.state.list_sessions()
+    chat_base = session_key_for_channel(ctx.msg.channel, ctx.msg.chat_id)
+    bases = {chat_base, session_base_key(current_key)}
     candidates = [
         info
         for info in infos
         if not str(info.get("key", "")).startswith(_SESSIONS_INTERNAL_PREFIXES)
+        and any(
+            session_key_under_base(str(info.get("key", "")), base) for base in bases
+        )
     ]
     shown = candidates[:_SESSIONS_MAX_LIST]
     if not shown:
