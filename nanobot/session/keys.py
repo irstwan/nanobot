@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Container, Mapping, MutableMapping
 from typing import Any
 
 UNIFIED_SESSION_KEY = "unified:default"
@@ -25,6 +25,30 @@ def session_key_for_channel(channel: str, chat_id: str, *, unified_session: bool
     if unified_session:
         return UNIFIED_SESSION_KEY
     return f"{channel}:{chat_id}"
+
+
+def session_key_under_base(key: str, base: str) -> bool:
+    """Whether *key* is *base* or a session derived from it.
+
+    Derived keys are topic threads (``base:topic:N``) and rotated sessions
+    started by ``/new`` (``base#N``). The separator check keeps ``173`` from
+    matching ``1730``.
+    """
+    return key == base or key.startswith(f"{base}:") or key.startswith(f"{base}#")
+
+
+def session_base_key(key: str) -> str:
+    """Return *key* without any ``/new`` rotation suffix (``...#N``)."""
+    base, sep, suffix = key.rpartition("#")
+    return base if sep and suffix.isdigit() else key
+
+
+def next_successor_session_key(base: str, taken: Container[str]) -> str:
+    """Return the first free ``base#N`` successor key at or after ``base#2``."""
+    index = 2
+    while f"{base}#{index}" in taken:
+        index += 1
+    return f"{base}#{index}"
 
 
 def remember_last_channel(

@@ -154,6 +154,10 @@ async def test_new_history_does_not_inherit_abandoned_turn(tmp_path, operation):
         target = "cli:limit"
         if operation == "reset":
             await loop.process_direct("/new", session_key=target)
+            follow_up = InboundMessage(
+                channel="cli", sender_id="user", chat_id="direct", content="hello"
+            )
+            target = loop._effective_session_key(follow_up)
         else:
             target = "cli:fork"
             await loop.sessions.state.fork("cli:limit", target, before_user_index=0)

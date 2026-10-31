@@ -74,7 +74,10 @@ class TestNewCommandArchival:
         assert "new session started" in response.content.lower()
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == 0
+        # The archived conversation stays put; the chat moves to a fresh session.
+        assert len(session_after.messages) == 10
+        fresh = await loop.sessions.state.get("cli:test#2")
+        assert fresh.messages == []
 
         await loop.aclose()
         assert call_count == 1
@@ -142,7 +145,10 @@ class TestNewCommandArchival:
 
         assert response is not None
         assert "new session started" in response.content.lower()
-        assert loop.sessions.get_or_create("cli:test").messages == []
+        # The previous conversation survives as its own session.
+        assert len(loop.sessions.get_or_create("cli:test").messages) == 6
+        fresh = await loop.sessions.state.get("cli:test#2")
+        assert fresh.messages == []
 
     @pytest.mark.asyncio
     async def test_aclose_drains_background_tasks(self, tmp_path: Path) -> None:
